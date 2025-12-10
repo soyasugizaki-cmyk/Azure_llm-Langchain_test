@@ -388,9 +388,12 @@ def create_synthesized_test_data(
 - 明確で具体的である
 - 回答がドキュメントから導き出せる
 - 日本語で記述されている
+- 質問文自体は自然な日本語として完結しており、指示や説明を含まない
 
 質問の傾向:
-{question_instructions_text}"""
+{question_instructions_text}
+
+重要: 質問文には「誤字を含めて」「注意：誤字あり」などの指示や説明を記載しないでください。質問文自体に誤字を含める場合は、自然に誤字を含めた質問文として記述してください。"""
     
     # question_instructions_textを先に置換（formatで置換）
     system_prompt_intermediate = system_prompt_template.format(question_instructions_text=question_instructions_text)
@@ -401,6 +404,7 @@ def create_synthesized_test_data(
     def generate_qa(doc_content: str) -> str:
         """ドキュメントから質問と回答を生成"""
         from langchain_core.messages import SystemMessage, HumanMessage
+        # 
         messages = [
             SystemMessage(content=system_prompt_intermediate),
             HumanMessage(content=f"以下のドキュメントから質問と回答のペアを生成してください:\n\n{doc_content}")
@@ -408,39 +412,6 @@ def create_synthesized_test_data(
         # LLMを直接呼び出し
         response = llm.invoke(messages)
         return response.content if hasattr(response, 'content') else str(response)
-    
-    # Embeddingsクライアントを作成（質問の類似度チェック用）
-    embeddings = create_azure_embeddings()
-    
-    # 質問の類似度をチェックする関数
-    def is_question_similar(new_question: str, existing_questions: List[str], threshold: float = QUESTION_SIMILARITY_THRESHOLD) -> bool:
-        """新しい質問が既存の質問と類似しているかチェック"""
-        if not existing_questions:
-            return False
-        
-        try:
-            # 既存の質問のベクトルを取得
-            existing_vectors = embeddings.embed_documents(existing_questions)
-            # 新しい質問のベクトルを取得
-            new_vector = embeddings.embed_query(new_question)
-            
-            # コサイン類似度を計算
-            existing_vectors_np = np.array(existing_vectors)
-            new_vector_np = np.array(new_vector)
-            
-            # 正規化
-            existing_norms = np.linalg.norm(existing_vectors_np, axis=1)
-            new_norm = np.linalg.norm(new_vector_np)
-            
-            # コサイン類似度 = (A・B) / (|A| * |B|)
-            similarities = np.dot(existing_vectors_np, new_vector_np) / (existing_norms * new_norm)
-            
-            # 最大類似度が閾値を超えているかチェック
-            return float(np.max(similarities)) >= threshold
-        except Exception as e:
-            print(f"   ⚠️  類似度チェックエラー: {str(e)[:100]}")
-            # エラー時は類似とみなさない（安全側に倒す）
-            return False
     
     # 段階的にサイズを減らしてリトライ
     testset_sizes = [TESTSET_SIZE, max(1, TESTSET_SIZE - 1), 1]
@@ -478,14 +449,9 @@ def create_synthesized_test_data(
                     doc_content = re.sub(r'\[CHUNK_ID:[^\]]+\]\n?', '', doc.page_content)
                     
                     # LLMで質問と回答を生成（LangChain版）
-                    # 【変更点】RAGAS版ではTestsetGenerator.generate_with_langchain_docs()を使用していたが、
-                    # LangChain版では各ドキュメントに対して個別にLLMを呼び出し
-                    # ChatPromptTemplateの代わりに、直接LLMを呼び出す関数を使用
                     response = generate_qa(doc_content)
                     
                     # JSONをパース（LangChain版）
-                    # 【変更点】RAGAS版ではTestsetGeneratorが自動的にパースしていたが、
-                    # LangChain版では明示的にJSONをパース
                     try:
                         qa_data = json.loads(response)
                         question = qa_data.get("question", "")
