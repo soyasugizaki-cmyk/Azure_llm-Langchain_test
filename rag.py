@@ -335,8 +335,9 @@ def create_synthesized_test_data(
             - "multi_hop": マルチホップ質問（複数の情報を組み合わせる）
             - "synonym": 同義語で言い換えた質問
             - "typo": 誤字を含む質問
-            - "negation": 否定形の質問
     """
+    # - "negation": 否定形の質問(一旦)
+
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
     import json
@@ -358,13 +359,13 @@ def create_synthesized_test_data(
     # LangChainのChatPromptTemplateを使用して質問と回答を生成
     question_instructions = []
     if "multi_hop" in question_types:
-        question_instructions.append("- 複数の情報を組み合わせて推論が必要な質問（マルチホップ）")
+        question_instructions.append("- 【重要】複数の情報を組み合わせて推論が必要な質問（マルチホップ）")
     if "synonym" in question_types:
-        question_instructions.append("- 同義語や類義語を使って言い換えた質問")
+        question_instructions.append("- 【重要】同義語や類義語を使って言い換えた質問")
     if "typo" in question_types:
-        question_instructions.append("- 意図的な誤字やタイプミスを含む質問（例：「蓋然性」→「蓮然性」、「契約」→「k約」、「利用」→「理容」など、よくある誤字や変換ミスを含める。質問文に必ず1つ以上の誤字を含めること）")
-    if "negation" in question_types:
-        question_instructions.append("- 否定形や反対の意味を問う質問")
+        question_instructions.append("- 【重要】意図的な誤字やタイプミスを含む質問（例：「蓋然性」→「蓮然性」、「契約」→「k約」、「利用」→「理容」など、よくある誤字や変換ミスを含める。質問文には「誤字を含めて」「注意：誤字あり」などの指示や説明を記載しないでください。質問文自体に誤字を含める場合は、自然に誤字を含めた質問文として記述してください。）")
+    #if "negation" in question_types:
+    #    question_instructions.append("- 否定形や反対の意味を問う質問")
     if "single_hop" in question_types or not question_instructions:
         question_instructions.append("- ドキュメントから直接答えられる単純な質問（シングルホップ）")
     
@@ -390,9 +391,7 @@ def create_synthesized_test_data(
 - 質問文自体は自然な日本語として完結しており、指示や説明を含まない
 
 質問の傾向:
-{question_instructions_text}
-
-重要: 質問文には「誤字を含めて」「注意：誤字あり」などの指示や説明を記載しないでください。質問文自体に誤字を含める場合は、自然に誤字を含めた質問文として記述してください。"""
+{question_instructions_text} """
     
     # question_instructions_textを先に置換（formatで置換）
     system_prompt_intermediate = system_prompt_template.format(question_instructions_text=question_instructions_text)
@@ -420,7 +419,7 @@ def create_synthesized_test_data(
             print(f"   試行 {attempt}/{len(testset_sizes)}: testset_size={size}")
             
             # ドキュメントからランダムに選択（重複を避ける）非復元抽出
-            # LangChain版では明示的にランダムサンプリング、
+            # LangChain版では明示的にランダムサンプリング
             # selected_docs = random.sample(documents, min(size, len(documents))) # sampleでは重複なしなので、chunk数が少ないとテストも少なくなる
             selected_docs = random.choices(documents, k=size) # こうすることで重複ありでテストを生成することができる  
             
@@ -780,8 +779,8 @@ def main():
         "--question-types",
         nargs="+",
         default=["single_hop"],
-        choices=["single_hop", "multi_hop", "synonym", "typo", "negation"],
-        help="質問の傾向を指定（複数指定可）: single_hop, multi_hop, synonym, typo, negation",
+        choices=["single_hop", "multi_hop", "synonym", "typo", ],#"negation"
+        help="質問の傾向を指定（複数指定可）: single_hop, multi_hop, synonym, typo" # negation
     )
     args = parser.parse_args()
     validate_azure_env_vars()
