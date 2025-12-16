@@ -569,6 +569,65 @@ def save_testset_to_cache(testset, documents: List[Document]):
     df_test.to_csv(TESTSET_CSV_FILE, index=False)
     print(f"💾 テストセットをCSVに保存しました: {TESTSET_CSV_FILE}")
 
+
+def analyze_question_diversity(user_inputs: List[str]) -> Dict[str, float]:
+    """生成された質問（user_input）の多様性指標を計算する
+    
+    指標:
+        - embedding_variance_mean:
+            質問埋め込みベクトルの次元ごとの分散の平均値
+            （値が大きいほど、テストケースが多様に広がっているとみなせる）
+        - nearest_neighbor_distance_mean:
+            各質問ベクトルとその最近傍ベクトルとのコサイン距離の平均
+            （値が小さいほど、質問同士が似通っており簡単・均質な傾向）
+        - nearest_neighbor_distance_variance:
+            上記最近傍距離の分散
+            （値が大きいほど、難易度・特徴がばらけているとみなせる）
+    """
+    if not user_inputs:
+        raise ValueError("user_inputs が空です。テストケースが存在しません。")
+    if len(user_inputs) == 1:
+        raise ValueError("user_inputs が 1 件のみのため、多様性指標を計算できません。")
+
+    # 質問の埋め込みを計算
+    embeddings_client = create_azure_embeddings()
+    # embed_documents は List[List[float]] を返す
+    embedding_list = embeddings_client.embed_documents(user_inputs)
+    embeddings_array = np.asarray(embedding_list, dtype=np.float64)  # shape: (N, D)
+
+    # 1. ベクトル分散（次元ごとの分散の平均）
+    #    N 個のベクトル x_i (i=1..N) に対し、各次元の分散 var_d をとり、その平均を指標とする
+    var_per_dim = np.var(embeddings_array, axis=0)  # shape: (D,)
+    embedding_variance_mean = float(np.mean(var_per_dim))
+
+    # 2. 最近傍ベクトルとのコサイン距離の平均と分散
+    #    各ベクトルを L2 正規化し、類似度行列 S = X_norm @ X_norm^T を計算
+    #    自己類似度を除いた最大値を最近傍類似度とし、距離 = 1 - 類似度 と定義
+    norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)  # shape: (N, 1)
+    # ゼロ除算を避けるために ε を加える
+    norms = np.where(norms == 0.0, 1e-12, norms)
+    normalized = embeddings_array / norms
+
+    # 類似度行列（N x N）
+    sim_matrix = normalized @ normalized.T
+    # 自己類似度を除外するために、対角成分を -inf に設定
+    np.fill_diagonal(sim_matrix, -np.inf)
+
+    # 各質問に対する最近傍の類似度
+    nearest_similarities = np.max(sim_matrix, axis=1)  # shape: (N,)
+    # 距離を 1 - cos 類似度 として定義
+    nearest_distances = 1.0 - nearest_similarities
+
+    nearest_neighbor_distance_mean = float(np.mean(nearest_distances))
+    nearest_neighbor_distance_variance = float(np.var(nearest_distances))
+
+    return {
+        "num_questions": len(user_inputs),
+        "embedding_variance_mean": embedding_variance_mean,
+        "nearest_neighbor_distance_mean": nearest_neighbor_distance_mean,
+        "nearest_neighbor_distance_variance": nearest_neighbor_distance_variance,
+    }
+
 def load_testset_from_cache():
     """キャッシュからテストセットを読み込み"""
     if TESTSET_CACHE_FILE.exists():
@@ -776,6 +835,11 @@ def main():
         help="評価をスキップ（テストデータの生成・保存のみ実行）",
     )
     parser.add_argument(
+        "--analyze-diversity",
+        action="store_true",
+        help="生成したテストケースの質問（user_input）の多様性指標を計算して表示する",
+    )
+    parser.add_argument(
         "--question-types",
         nargs="+",
         default=["single_hop"],
@@ -827,6 +891,27 @@ def main():
                 print("⚠️  テストデータがないため、処理を終了します")
                 print("=" * 50)
                 return
+
+    # 生成・読み込み済みのテストセットに対して、質問多様性を解析（オプション）
+    if args.analyze_diversity and testset is not None:
+        print("📐 生成済みテストケースの質問多様性を解析しています...")
+        try:
+            df_test = testset.to_pandas()
+            if "user_input" not in df_test.columns:
+                print("⚠️  DataFrame に 'user_input' 列が存在しないため、多様性指標を計算できません。")
+            else:
+                user_inputs = df_test["user_input"].astype(str).tolist()
+                diversity_metrics = analyze_question_diversity(user_inputs)
+
+                print("🧮 質問多様性メトリクス:")
+                print(f"  - 質問数: {diversity_metrics['num_questions']}")
+                print(f"  - 埋め込みベクトル分散の平均 (embedding_variance_mean): {diversity_metrics['embedding_variance_mean']:.6f}")
+                print(f"  - 最近傍距離の平均 (nearest_neighbor_distance_mean): {diversity_metrics['nearest_neighbor_distance_mean']:.6f}")
+                print(f"  - 最近傍距離の分散 (nearest_neighbor_distance_variance): {diversity_metrics['nearest_neighbor_distance_variance']:.6f}")
+                print()
+        except Exception as e:
+            print(f"⚠️  質問多様性メトリクスの計算中にエラーが発生しました: {e}")
+            print()
     
     # LangSmithへの保存
     dataset = None
