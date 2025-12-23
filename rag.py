@@ -51,7 +51,7 @@ AZURE_MAX_RETRIES = 2
 
 # RAG設定
 DEFAULT_RETRIEVER_K = 2 # 取得するチャンク数
-TESTSET_SIZE = 10 # 生成するテストセットの数
+TESTSET_SIZE = 9 # 生成するテストセットの数
 
 # テスト生成時の多様性確保設定
 QUESTION_SIMILARITY_THRESHOLD = 0.85  # 質問の類似度閾値（これ以上は除外）
@@ -336,8 +336,9 @@ def create_synthesized_test_data(
             - "multi_hop": マルチホップ質問（複数の情報を組み合わせる）
             - "synonym": 同義語で言い換えた質問
             - "typo": 誤字を含む質問
-            - "negation": 否定形の質問
     """
+    # - "negation": 否定形の質問(一旦)
+
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
     import json
@@ -359,13 +360,13 @@ def create_synthesized_test_data(
     # LangChainのChatPromptTemplateを使用して質問と回答を生成
     question_instructions = []
     if "multi_hop" in question_types:
-        question_instructions.append("- 複数の情報を組み合わせて推論が必要な質問（マルチホップ）")
+        question_instructions.append("- 【重要】複数の情報を組み合わせて推論が必要な質問（マルチホップ）")
     if "synonym" in question_types:
-        question_instructions.append("- 同義語や類義語を使って言い換えた質問")
+        question_instructions.append("- 【重要】同義語や類義語を使って言い換えた質問")
     if "typo" in question_types:
-        question_instructions.append("- 意図的な誤字やタイプミスを含む質問（例：「蓋然性」→「蓮然性」、「契約」→「k約」、「利用」→「理容」など、よくある誤字や変換ミスを含める。質問文に必ず1つ以上の誤字を含めること）")
-    if "negation" in question_types:
-        question_instructions.append("- 否定形や反対の意味を問う質問")
+        question_instructions.append("- 【重要】意図的な誤字やタイプミスを含む質問（例：「蓋然性」→「蓮然性」、「契約」→「k約」、「利用」→「理容」など、よくある誤字や変換ミスを含める。質問文には「誤字を含めて」「注意：誤字あり」などの指示や説明を記載しないでください。質問文自体に誤字を含める場合は、自然に誤字を含めた質問文として記述してください。）")
+    #if "negation" in question_types:
+    #    question_instructions.append("- 否定形や反対の意味を問う質問")
     if "single_hop" in question_types or not question_instructions:
         question_instructions.append("- ドキュメントから直接答えられる単純な質問（シングルホップ）")
     
@@ -391,9 +392,7 @@ def create_synthesized_test_data(
 - 質問文自体は自然な日本語として完結しており、指示や説明を含まない
 
 質問の傾向:
-{question_instructions_text}
-
-重要: 質問文には「誤字を含めて」「注意：誤字あり」などの指示や説明を記載しないでください。質問文自体に誤字を含める場合は、自然に誤字を含めた質問文として記述してください。"""
+{question_instructions_text} """
     
     # question_instructions_textを先に置換（formatで置換）
     system_prompt_intermediate = system_prompt_template.format(question_instructions_text=question_instructions_text)
@@ -420,7 +419,11 @@ def create_synthesized_test_data(
         try:
             print(f"   試行 {attempt}/{len(testset_sizes)}: testset_size={size}")
             
-            # 目標数のテストが生成されるまでループを続ける
+            # ドキュメントからランダムに選択（重複を避ける）非復元抽出
+            # LangChain版では明示的にランダムサンプリング
+            # selected_docs = random.sample(documents, min(size, len(documents))) # sampleでは重複なしなので、chunk数が少ないとテストも少なくなる
+            selected_docs = random.choices(documents, k=size) # こうすることで重複ありでテストを生成することができる  
+            
             test_samples = []
             existing_questions = []  # 既存の質問を保持（類似度チェック用）
             chunk_usage_count = {}  # チャンクの使用回数をカウント
@@ -597,6 +600,120 @@ def save_testset_to_cache(testset, documents: List[Document]):
     
     df_test.to_csv(TESTSET_CSV_FILE, index=False)
     print(f"💾 テストセットをCSVに保存しました: {TESTSET_CSV_FILE}")
+
+
+def analyze_question_diversity(user_inputs: List[str], expected_chunk_ids: List[str]) -> Dict[str, float]:
+    """生成された質問（user_input）と期待されるチャンクID（expected_chunk_ids）の多様性指標を計算する
+    
+    指標:
+        - embedding_variance_mean:
+            質問埋め込みベクトルの次元ごとの分散の平均値
+            （値が大きいほど、テストケースが多様に広がっているとみなせる）
+        - nearest_neighbor_similarity_mean:
+            各質問とそれ以外の質問のコサイン類似度を計算し、その最大値（最近傍類似度）を取り、
+            それらの平均を返す（値が大きいほど質問が似通っている傾向）
+        - nearest_neighbor_similarity_variance:
+            上記最近傍類似度の分散（値が大きいほど、質問間の近さのばらつきが大きい）
+        - nearest_neighbor_distance_mean:
+            各質問ベクトルとその最近傍ベクトルとのコサイン距離の平均
+            （値が小さいほど、質問同士が似通っており簡単・均質な傾向）
+        - nearest_neighbor_distance_variance:
+            上記最近傍距離の分散
+            （値が大きいほど、難易度・特徴がばらけているとみなせる）
+    """
+    if not user_inputs:
+        raise ValueError("user_inputs が空です。テストケースが存在しません。")
+    if len(user_inputs) == 1:
+        raise ValueError("user_inputs が 1 件のみのため、多様性指標を計算できません。")
+
+    # 質問の埋め込みを計算
+    embeddings_client = create_azure_embeddings()
+    # ここで期待チャンクの指標を計算
+    # expected_chunk_embeddings = embeddings_client.embed_documents(expected_chunk_ids) 
+    # embed_documents は List[List[float]] を返す
+    embedding_list = embeddings_client.embed_documents(user_inputs)
+    embeddings_array = np.asarray(embedding_list, dtype=np.float64)  # shape: (N, D)
+
+    # 1. ベクトル分散（次元ごとの分散の平均）
+    #    N 個のベクトル x_i (i=1..N) に対し、各次元の分散 var_d をとり、その平均を指標とする
+    var_per_dim = np.var(embeddings_array, axis=0)  # shape: (D,)
+    embedding_variance_mean = float(np.mean(var_per_dim))
+
+    # 2. 最近傍ベクトルとのコサイン距離の平均と分散
+    #    各ベクトルを L2 正規化し、類似度行列 S = X_norm @ X_norm^T を計算
+    #    自己類似度を除いた最大値を最近傍類似度とし、距離 = 1 - 類似度 と定義
+    norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)  # shape: (N, 1)
+    # ゼロ除算を避けるために ε を加える
+    norms = np.where(norms == 0.0, 1e-12, norms)
+    normalized = embeddings_array / norms
+
+    # 類似度行列（N x N）
+    sim_matrix = normalized @ normalized.T
+    # 自己類似度を除外するために、対角成分を -inf に設定
+    np.fill_diagonal(sim_matrix, -np.inf)
+
+    # 各質問に対する最近傍の類似度
+    nearest_similarities = np.max(sim_matrix, axis=1)  # shape: (N,)
+    # 距離を 1 - cos 類似度 として定義
+    nearest_distances = 1.0 - nearest_similarities
+
+    # 追加: 最近傍（最大）コサイン類似度の平均と分散
+    nearest_neighbor_similarity_mean = float(np.mean(nearest_similarities))
+    nearest_neighbor_similarity_variance = float(np.var(nearest_similarities))
+
+    nearest_neighbor_distance_mean = float(np.mean(nearest_distances))
+    nearest_neighbor_distance_variance = float(np.var(nearest_distances))
+
+    return {
+        "num_questions": len(user_inputs),
+        "embedding_variance_mean": embedding_variance_mean,
+        "nearest_neighbor_similarity_mean": nearest_neighbor_similarity_mean,
+        "nearest_neighbor_similarity_variance": nearest_neighbor_similarity_variance,
+        "nearest_neighbor_distance_mean": nearest_neighbor_distance_mean,
+        "nearest_neighbor_distance_variance": nearest_neighbor_distance_variance,
+    }
+
+def _extract_user_inputs_and_expected_chunk_ids(testset) -> Tuple[List[str], List[str]]:
+    """テストセットから user_input と expected_chunk_ids を可能な限り抽出する（安全版）"""
+    user_inputs: List[str] = []
+    expected_chunk_ids: List[str] = []
+
+    # 1) to_pandas() から取得を試みる（user_input はあるが expected_chunk_ids は無い場合がある）
+    try:
+        df_test = testset.to_pandas()
+        if "user_input" in df_test.columns:
+            user_inputs = df_test["user_input"].astype(str).tolist()
+        if "expected_chunk_ids" in df_test.columns:
+            expected_chunk_ids = df_test["expected_chunk_ids"].astype(str).tolist()
+    except Exception:
+        pass
+
+    # 2) samples からフォールバック
+    if (not user_inputs) and hasattr(testset, "samples"):
+        try:
+            user_inputs = [str(s.get("user_input", "")) for s in testset.samples if str(s.get("user_input", "")).strip()]
+        except Exception:
+            user_inputs = []
+        try:
+            expected_chunk_ids = []
+            for s in testset.samples:
+                chunk_id = s.get("chunk_id")
+                expected_chunk_ids.append(str([chunk_id]) if chunk_id else "[]")
+        except Exception:
+            expected_chunk_ids = []
+
+    # 3) CSV キャッシュからフォールバック（存在する場合）
+    if (not expected_chunk_ids) and TESTSET_CSV_FILE.exists():
+        try:
+            df_csv = pd.read_csv(TESTSET_CSV_FILE)
+            if not user_inputs and "user_input" in df_csv.columns:
+                user_inputs = df_csv["user_input"].astype(str).tolist()
+            if "expected_chunk_ids" in df_csv.columns:
+                expected_chunk_ids = df_csv["expected_chunk_ids"].astype(str).tolist()
+        except Exception:
+            pass
+
+    return user_inputs, expected_chunk_ids
 
 def load_testset_from_cache():
     """キャッシュからテストセットを読み込み"""
@@ -805,11 +922,16 @@ def main():
         help="評価をスキップ（テストデータの生成・保存のみ実行）",
     )
     parser.add_argument(
+        "--analyze-diversity",
+        action="store_true",
+        help="生成したテストケースの質問（user_input）の多様性指標を計算して表示する",
+    )
+    parser.add_argument(
         "--question-types",
         nargs="+",
         default=["single_hop"],
-        choices=["single_hop", "multi_hop", "synonym", "typo", "negation"],
-        help="質問の傾向を指定（複数指定可）: single_hop, multi_hop, synonym, typo, negation",
+        choices=["single_hop", "multi_hop", "synonym", "typo", ],#"negation"
+        help="質問の傾向を指定（複数指定可）: single_hop, multi_hop, synonym, typo" # negation
     )
     args = parser.parse_args()
     validate_azure_env_vars()
@@ -856,6 +978,28 @@ def main():
                 print("⚠️  テストデータがないため、処理を終了します")
                 print("=" * 50)
                 return
+
+    # 生成・読み込み済みのテストセットに対して、質問多様性を解析（オプション）
+    if args.analyze_diversity and testset is not None:
+        print("📐 生成済みテストケースの質問多様性を解析しています...")
+        try:
+            user_inputs, expected_chunk_ids = _extract_user_inputs_and_expected_chunk_ids(testset)
+            if not user_inputs:
+                print("⚠️  テストセットから 'user_input' を抽出できなかったため、多様性指標を計算できません。")
+            else:
+                diversity_metrics = analyze_question_diversity(user_inputs, expected_chunk_ids)
+
+                print("🧮 質問多様性メトリクス:")
+                print(f"  - 質問数: {diversity_metrics['num_questions']}")
+                print(f"  - 埋め込みベクトル分散の平均 (embedding_variance_mean): {diversity_metrics['embedding_variance_mean']:.6f}")
+                print(f"  - 最近傍類似度の平均 (nearest_neighbor_similarity_mean): {diversity_metrics['nearest_neighbor_similarity_mean']:.6f}")
+                print(f"  - 最近傍類似度の分散 (nearest_neighbor_similarity_variance): {diversity_metrics['nearest_neighbor_similarity_variance']:.6f}")
+                print(f"  - 最近傍距離の平均 (nearest_neighbor_distance_mean): {diversity_metrics['nearest_neighbor_distance_mean']:.6f}")
+                print(f"  - 最近傍距離の分散 (nearest_neighbor_distance_variance): {diversity_metrics['nearest_neighbor_distance_variance']:.6f}")
+                print()
+        except Exception as e:
+            print(f"⚠️  質問多様性メトリクスの計算中にエラーが発生しました: {e}")
+            print()
     
     # LangSmithへの保存
     dataset = None
@@ -909,7 +1053,9 @@ def main():
                 if 'feedback.context_precision' in df.columns and 'feedback.answer_relevancy' in df.columns:
                     print("\n📊 スコアサマリー:")
                     print(f"  - Context Precision 平均: {df['feedback.context_precision'].mean():.3f}")
-                    print(f"  - Answer Relevancy 平均: {df['feedback.answer_relevancy'].mean():.3f}")
+                    print(f"  - Context Precision 標準偏差: {df['feedback.context_precision'].std():.3f}")
+                    print(f"  - Context Recall 平均: {df['feedback.context_recall'].mean():.3f}")
+                    print(f"  - Context Recall 標準偏差: {df['feedback.context_recall'].std():.3f}")
             else:
                 print("⚠️  評価をスキップしました（LangSmith APIキーが未設定）\n")
     else:
