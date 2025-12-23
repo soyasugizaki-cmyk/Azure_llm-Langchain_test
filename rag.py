@@ -51,7 +51,7 @@ AZURE_MAX_RETRIES = 2
 
 # RAG設定
 DEFAULT_RETRIEVER_K = 2 # 取得するチャンク数
-TESTSET_SIZE = 10 # 生成するテストセットの数
+TESTSET_SIZE = 9 # 生成するテストセットの数
 
 # テスト生成時の多様性確保設定
 QUESTION_SIMILARITY_THRESHOLD = 0.85  # 質問の類似度閾値（これ以上は除外）
@@ -570,13 +570,18 @@ def save_testset_to_cache(testset, documents: List[Document]):
     print(f"💾 テストセットをCSVに保存しました: {TESTSET_CSV_FILE}")
 
 
-def analyze_question_diversity(user_inputs: List[str]) -> Dict[str, float]:
-    """生成された質問（user_input）の多様性指標を計算する
+def analyze_question_diversity(user_inputs: List[str], expected_chunk_ids: List[str]) -> Dict[str, float]:
+    """生成された質問（user_input）と期待されるチャンクID（expected_chunk_ids）の多様性指標を計算する
     
     指標:
         - embedding_variance_mean:
             質問埋め込みベクトルの次元ごとの分散の平均値
             （値が大きいほど、テストケースが多様に広がっているとみなせる）
+        - nearest_neighbor_similarity_mean:
+            各質問とそれ以外の質問のコサイン類似度を計算し、その最大値（最近傍類似度）を取り、
+            それらの平均を返す（値が大きいほど質問が似通っている傾向）
+        - nearest_neighbor_similarity_variance:
+            上記最近傍類似度の分散（値が大きいほど、質問間の近さのばらつきが大きい）
         - nearest_neighbor_distance_mean:
             各質問ベクトルとその最近傍ベクトルとのコサイン距離の平均
             （値が小さいほど、質問同士が似通っており簡単・均質な傾向）
@@ -591,6 +596,8 @@ def analyze_question_diversity(user_inputs: List[str]) -> Dict[str, float]:
 
     # 質問の埋め込みを計算
     embeddings_client = create_azure_embeddings()
+    # ここで期待チャンクの指標を計算
+    # expected_chunk_embeddings = embeddings_client.embed_documents(expected_chunk_ids) 
     # embed_documents は List[List[float]] を返す
     embedding_list = embeddings_client.embed_documents(user_inputs)
     embeddings_array = np.asarray(embedding_list, dtype=np.float64)  # shape: (N, D)
@@ -618,15 +625,63 @@ def analyze_question_diversity(user_inputs: List[str]) -> Dict[str, float]:
     # 距離を 1 - cos 類似度 として定義
     nearest_distances = 1.0 - nearest_similarities
 
+    # 追加: 最近傍（最大）コサイン類似度の平均と分散
+    nearest_neighbor_similarity_mean = float(np.mean(nearest_similarities))
+    nearest_neighbor_similarity_variance = float(np.var(nearest_similarities))
+
     nearest_neighbor_distance_mean = float(np.mean(nearest_distances))
     nearest_neighbor_distance_variance = float(np.var(nearest_distances))
 
     return {
         "num_questions": len(user_inputs),
         "embedding_variance_mean": embedding_variance_mean,
+        "nearest_neighbor_similarity_mean": nearest_neighbor_similarity_mean,
+        "nearest_neighbor_similarity_variance": nearest_neighbor_similarity_variance,
         "nearest_neighbor_distance_mean": nearest_neighbor_distance_mean,
         "nearest_neighbor_distance_variance": nearest_neighbor_distance_variance,
     }
+
+def _extract_user_inputs_and_expected_chunk_ids(testset) -> Tuple[List[str], List[str]]:
+    """テストセットから user_input と expected_chunk_ids を可能な限り抽出する（安全版）"""
+    user_inputs: List[str] = []
+    expected_chunk_ids: List[str] = []
+
+    # 1) to_pandas() から取得を試みる（user_input はあるが expected_chunk_ids は無い場合がある）
+    try:
+        df_test = testset.to_pandas()
+        if "user_input" in df_test.columns:
+            user_inputs = df_test["user_input"].astype(str).tolist()
+        if "expected_chunk_ids" in df_test.columns:
+            expected_chunk_ids = df_test["expected_chunk_ids"].astype(str).tolist()
+    except Exception:
+        pass
+
+    # 2) samples からフォールバック
+    if (not user_inputs) and hasattr(testset, "samples"):
+        try:
+            user_inputs = [str(s.get("user_input", "")) for s in testset.samples if str(s.get("user_input", "")).strip()]
+        except Exception:
+            user_inputs = []
+        try:
+            expected_chunk_ids = []
+            for s in testset.samples:
+                chunk_id = s.get("chunk_id")
+                expected_chunk_ids.append(str([chunk_id]) if chunk_id else "[]")
+        except Exception:
+            expected_chunk_ids = []
+
+    # 3) CSV キャッシュからフォールバック（存在する場合）
+    if (not expected_chunk_ids) and TESTSET_CSV_FILE.exists():
+        try:
+            df_csv = pd.read_csv(TESTSET_CSV_FILE)
+            if not user_inputs and "user_input" in df_csv.columns:
+                user_inputs = df_csv["user_input"].astype(str).tolist()
+            if "expected_chunk_ids" in df_csv.columns:
+                expected_chunk_ids = df_csv["expected_chunk_ids"].astype(str).tolist()
+        except Exception:
+            pass
+
+    return user_inputs, expected_chunk_ids
 
 def load_testset_from_cache():
     """キャッシュからテストセットを読み込み"""
@@ -896,16 +951,17 @@ def main():
     if args.analyze_diversity and testset is not None:
         print("📐 生成済みテストケースの質問多様性を解析しています...")
         try:
-            df_test = testset.to_pandas()
-            if "user_input" not in df_test.columns:
-                print("⚠️  DataFrame に 'user_input' 列が存在しないため、多様性指標を計算できません。")
+            user_inputs, expected_chunk_ids = _extract_user_inputs_and_expected_chunk_ids(testset)
+            if not user_inputs:
+                print("⚠️  テストセットから 'user_input' を抽出できなかったため、多様性指標を計算できません。")
             else:
-                user_inputs = df_test["user_input"].astype(str).tolist()
-                diversity_metrics = analyze_question_diversity(user_inputs)
+                diversity_metrics = analyze_question_diversity(user_inputs, expected_chunk_ids)
 
                 print("🧮 質問多様性メトリクス:")
                 print(f"  - 質問数: {diversity_metrics['num_questions']}")
                 print(f"  - 埋め込みベクトル分散の平均 (embedding_variance_mean): {diversity_metrics['embedding_variance_mean']:.6f}")
+                print(f"  - 最近傍類似度の平均 (nearest_neighbor_similarity_mean): {diversity_metrics['nearest_neighbor_similarity_mean']:.6f}")
+                print(f"  - 最近傍類似度の分散 (nearest_neighbor_similarity_variance): {diversity_metrics['nearest_neighbor_similarity_variance']:.6f}")
                 print(f"  - 最近傍距離の平均 (nearest_neighbor_distance_mean): {diversity_metrics['nearest_neighbor_distance_mean']:.6f}")
                 print(f"  - 最近傍距離の分散 (nearest_neighbor_distance_variance): {diversity_metrics['nearest_neighbor_distance_variance']:.6f}")
                 print()
@@ -965,7 +1021,9 @@ def main():
                 if 'feedback.context_precision' in df.columns and 'feedback.answer_relevancy' in df.columns:
                     print("\n📊 スコアサマリー:")
                     print(f"  - Context Precision 平均: {df['feedback.context_precision'].mean():.3f}")
-                    print(f"  - Answer Relevancy 平均: {df['feedback.answer_relevancy'].mean():.3f}")
+                    print(f"  - Context Precision 標準偏差: {df['feedback.context_precision'].std():.3f}")
+                    print(f"  - Context Recall 平均: {df['feedback.context_recall'].mean():.3f}")
+                    print(f"  - Context Recall 標準偏差: {df['feedback.context_recall'].std():.3f}")
             else:
                 print("⚠️  評価をスキップしました（LangSmith APIキーが未設定）\n")
     else:
