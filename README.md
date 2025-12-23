@@ -1,4 +1,4 @@
-# RAG POC
+# Azure OpenAI + LangChain RAG PoC
 
 Azure OpenAIを使用したRAG（Retrieval-Augmented Generation）の実証実験プロジェクトです。
 
