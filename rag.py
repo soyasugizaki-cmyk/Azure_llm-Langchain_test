@@ -56,6 +56,7 @@ TESTSET_SIZE = 9 # 生成するテストセットの数
 # テスト生成時の多様性確保設定
 QUESTION_SIMILARITY_THRESHOLD = 0.85  # 質問の類似度閾値（これ以上は除外）
 MAX_CHUNK_USAGE_COUNT = 2  # 同じチャンクから生成できる最大回数
+MAX_GENERATION_ATTEMPTS = 50  # テスト生成の最大試行回数（無限ループ防止）
 
 # Azure OpenAIの環境変数設定を確認
 def validate_azure_env_vars():
@@ -424,11 +425,28 @@ def create_synthesized_test_data(
             selected_docs = random.choices(documents, k=size) # こうすることで重複ありでテストを生成することができる  
             
             test_samples = []
-            for idx, doc in enumerate(selected_docs):
+            existing_questions = []  # 既存の質問を保持（類似度チェック用）
+            chunk_usage_count = {}  # チャンクの使用回数をカウント
+            attempt_count = 0  # 試行回数（スキップも含む）
+            generated_count = 0  # 実際に生成されたテスト数（スキップは含まない）
+            
+            while generated_count < size and attempt_count < MAX_GENERATION_ATTEMPTS:
+                attempt_count += 1
                 try:
+                    # 重複なしのドキュメントの場合は以下を採用
+                    # doc = random.sample(documents, min(size, len(documents)))
+                    # ドキュメントからランダムに選択（重複あり）
+                    doc = random.choice(documents)
+                    
                     # チャンクIDを抽出
                     chunk_id_match = re.search(r'\[CHUNK_ID:([^\]]+)\]', doc.page_content)
-                    chunk_id = chunk_id_match.group(1) if chunk_id_match else doc.metadata.get("chunk_id", f"chunk_{idx}")
+                    chunk_id = chunk_id_match.group(1) if chunk_id_match else doc.metadata.get("chunk_id", "unknown")
+                    
+                    # チャンクの使用頻度をチェック
+                    chunk_usage_count[chunk_id] = chunk_usage_count.get(chunk_id, 0)
+                    if chunk_usage_count[chunk_id] >= MAX_CHUNK_USAGE_COUNT:
+                        print(f"   ⚠️  試行 {attempt_count}: チャンク {chunk_id} の使用回数が上限に達しています。スキップします。")
+                        continue
                     
                     # ドキュメント内容からマーカーを除去（プロンプトに含めるため）
                     doc_content = re.sub(r'\[CHUNK_ID:[^\]]+\]\n?', '', doc.page_content)
@@ -443,7 +461,12 @@ def create_synthesized_test_data(
                         answer = qa_data.get("answer", "")
                         
                         if not question or not answer:
-                            print(f"   ⚠️  サンプル {idx+1}: 質問または回答が空です。スキップします。")
+                            print(f"   ⚠️  試行 {attempt_count}: 質問または回答が空です。スキップします。")
+                            continue
+                        
+                        # 質問の類似度をチェック（既存の質問と似すぎていないか）
+                        if is_question_similar(question, existing_questions):
+                            print(f"   ⚠️  試行 {attempt_count}: 既存の質問と類似度が高すぎます。スキップします。")
                             continue
                         
                         # テストサンプルを作成（LangChain版のデータ構造）
@@ -458,15 +481,24 @@ def create_synthesized_test_data(
                             "source_file": doc.metadata.get("source_file", "unknown"),
                         })
                         
-                        print(f"   ✓ サンプル {idx+1}/{size} を生成しました")
+                        # 既存の質問リストとチャンク使用回数を更新
+                        existing_questions.append(question)
+                        chunk_usage_count[chunk_id] = chunk_usage_count.get(chunk_id, 0) + 1
+                        generated_count += 1
+                        
+                        print(f"   ✓ サンプル {generated_count}/{size} を生成しました（試行 {attempt_count}、チャンク {chunk_id} 使用回数: {chunk_usage_count[chunk_id]}）")
                         
                     except json.JSONDecodeError as e:
-                        print(f"   ⚠️  サンプル {idx+1}: JSONパースエラー - {str(e)[:100]}")
+                        print(f"   ⚠️  試行 {attempt_count}: JSONパースエラー - {str(e)[:100]}")
                         continue
                         
                 except Exception as e:
-                    print(f"   ⚠️  サンプル {idx+1}: エラー - {str(e)[:100]}")
+                    print(f"   ⚠️  試行 {attempt_count}: エラー - {str(e)[:100]}")
                     continue
+            
+            # 最大試行回数に達した場合の警告
+            if attempt_count >= MAX_GENERATION_ATTEMPTS:
+                print(f"   ⚠️  最大試行回数（{MAX_GENERATION_ATTEMPTS}回）に達しました。生成されたテスト数: {generated_count}/{size}")
             
             if len(test_samples) == 0:
                 raise ValueError("テストサンプルが1つも生成できませんでした")
